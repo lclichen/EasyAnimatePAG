@@ -28,7 +28,10 @@ from diffusers import DiffusionPipeline, ImagePipelineOutput
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL, HunyuanDiT2DModel
+from diffusers.models.attention_processor import (
+    PAGCFGHunyuanAttnProcessor2_0, PAGHunyuanAttnProcessor2_0)
 from diffusers.models.embeddings import get_2d_rotary_pos_embed
+from diffusers.pipelines.pag.pag_utils import PAGMixin
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import \
@@ -147,8 +150,7 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
     return noise_cfg
 
-
-class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
+class EasyAnimatePAGPipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline, PAGMixin):
     r"""
     Pipeline for English/Chinese-to-image generation using HunyuanDiT.
 
@@ -210,6 +212,7 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
         tokenizer_2=MT5Tokenizer,
         clip_image_processor:CLIPImageProcessor = None,
         clip_image_encoder:CLIPVisionModelWithProjection = None,
+        pag_applied_layers: Union[str, List[str]] = "blocks.1",  # "blocks.16.attn1", "blocks.16", "16", 16
     ):
         super().__init__()
 
@@ -251,7 +254,9 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
             vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
         )
         self.model_cpu_offload_flag = False
-
+        self.set_pag_applied_layers(
+            pag_applied_layers, pag_attn_processors=(PAGCFGHunyuanAttnProcessor2_0(), PAGHunyuanAttnProcessor2_0())
+        )
     def enable_sequential_cpu_offload(self, *args, **kwargs):
         super().enable_sequential_cpu_offload(*args, **kwargs)
         self.model_cpu_offload_flag = False
@@ -795,6 +800,8 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
         clip_apply_ratio: float = 0.40,
         strength: float = 1.0,
         comfyui_progressbar: bool = False,
+        pag_scale: float = 3.0,
+        pag_adaptive_scale: float = 0.0,
     ):
         r"""
         The call function to the pipeline for generation with HunyuanDiT.
@@ -885,6 +892,8 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
         width = width or self.default_sample_size * self.vae_scale_factor
         height = int(height // 16 * 16)
         width = int(width // 16 * 16)
+        self._pag_scale = pag_scale
+        self._pag_adaptive_scale = pag_adaptive_scale
 
         if use_resolution_binning and (height, width) not in SUPPORTED_SHAPE:
             width, height = map_to_standard_shapes(width, height)
@@ -921,6 +930,13 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
             batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
+        B_PAG = 1
+        if self.do_classifier_free_guidance:
+            B_PAG += 1
+        if self.do_perturbed_attention_guidance:
+            B_PAG += 1
+        # B_PAG = (prompt_embeds.shape[0] // latents.shape[0])
+        print("B_PAG=", B_PAG)
 
         # 3. Encode input prompt
 
@@ -1033,9 +1049,15 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
 
             clip_attention_mask = torch.ones([batch_size, self.transformer.n_query]).to(latents.device, dtype=latents.dtype)
             clip_attention_mask_neg = torch.zeros([batch_size, self.transformer.n_query]).to(latents.device, dtype=latents.dtype)
-
-            clip_encoder_hidden_states_input = torch.cat([clip_encoder_hidden_states_neg, clip_encoder_hidden_states]) if self.do_classifier_free_guidance else clip_encoder_hidden_states
-            clip_attention_mask_input = torch.cat([clip_attention_mask_neg, clip_attention_mask]) if self.do_classifier_free_guidance else clip_attention_mask
+            
+            clip_encoder_hidden_states_input = self._prepare_perturbed_attention_guidance(
+                clip_encoder_hidden_states, clip_encoder_hidden_states_neg, self.do_classifier_free_guidance
+            )
+            clip_attention_mask_input = self._prepare_perturbed_attention_guidance(
+                clip_attention_mask, clip_attention_mask_neg, self.do_classifier_free_guidance
+            )
+            # clip_encoder_hidden_states_input = torch.cat([clip_encoder_hidden_states_neg, clip_encoder_hidden_states]) if self.do_classifier_free_guidance else clip_encoder_hidden_states
+            # clip_attention_mask_input = torch.cat([clip_attention_mask_neg, clip_attention_mask]) if self.do_classifier_free_guidance else clip_attention_mask
 
         elif clip_image is None and num_channels_transformer != num_channels_latents:
             clip_encoder_hidden_states = torch.zeros(
@@ -1049,8 +1071,8 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
             clip_attention_mask = torch.zeros([batch_size, self.transformer.n_query])
             clip_attention_mask = clip_attention_mask.to(latents.device, dtype=latents.dtype)
 
-            clip_encoder_hidden_states_input = torch.cat([clip_encoder_hidden_states] * 2) if self.do_classifier_free_guidance else clip_encoder_hidden_states
-            clip_attention_mask_input = torch.cat([clip_attention_mask] * 2) if self.do_classifier_free_guidance else clip_attention_mask
+            clip_encoder_hidden_states_input = torch.cat([clip_encoder_hidden_states] * B_PAG) # if self.do_classifier_free_guidance else clip_encoder_hidden_states
+            clip_attention_mask_input = torch.cat([clip_attention_mask] * B_PAG) # if self.do_classifier_free_guidance else clip_attention_mask
 
         else:
             clip_encoder_hidden_states_input = None
@@ -1063,9 +1085,9 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
                 mask_latents = torch.zeros_like(latents).to(latents.device, latents.dtype)
                 masked_video_latents = torch.zeros_like(latents).to(latents.device, latents.dtype)
 
-                mask_input = torch.cat([mask_latents] * 2) if self.do_classifier_free_guidance else mask_latents
+                mask_input = torch.cat([mask_latents] * B_PAG) # if self.do_classifier_free_guidance else mask_latents
                 masked_video_latents_input = (
-                    torch.cat([masked_video_latents] * 2) if self.do_classifier_free_guidance else masked_video_latents
+                    torch.cat([masked_video_latents] * B_PAG) # if self.do_classifier_free_guidance else masked_video_latents
                 )
                 inpaint_latents = torch.cat([mask_input, masked_video_latents_input], dim=1).to(latents.dtype)
             else:
@@ -1096,9 +1118,9 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
                     mask = torch.tile(mask_condition, [1, num_channels_latents, 1, 1, 1])
                     mask = F.interpolate(mask, size=latents.size()[-3:], mode='trilinear', align_corners=True).to(latents.device, latents.dtype)
                     
-                    mask_input = torch.cat([mask_latents] * 2) if self.do_classifier_free_guidance else mask_latents
+                    mask_input = torch.cat([mask_latents] * B_PAG) # if self.do_classifier_free_guidance else mask_latents
                     masked_video_latents_input = (
-                        torch.cat([masked_video_latents] * 2) if self.do_classifier_free_guidance else masked_video_latents
+                        torch.cat([masked_video_latents] * B_PAG) # if self.do_classifier_free_guidance else masked_video_latents
                     )
                     inpaint_latents = torch.cat([mask_input, masked_video_latents_input], dim=1).to(latents.dtype)
                 else:
@@ -1111,9 +1133,9 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
                 mask = torch.zeros_like(latents).to(latents.device, latents.dtype)
                 masked_video_latents = torch.zeros_like(latents).to(latents.device, latents.dtype)
 
-                mask_input = torch.cat([mask] * 2) if self.do_classifier_free_guidance else mask
+                mask_input = torch.cat([mask] * B_PAG) # if self.do_classifier_free_guidance else mask
                 masked_video_latents_input = (
-                    torch.cat([masked_video_latents] * 2) if self.do_classifier_free_guidance else masked_video_latents
+                    torch.cat([masked_video_latents] * B_PAG) # if self.do_classifier_free_guidance else masked_video_latents
                 )
                 inpaint_latents = torch.cat([mask_input, masked_video_latents_input], dim=1).to(latents.dtype)
             else:
@@ -1161,7 +1183,25 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
         add_time_ids = list(original_size + target_size + crops_coords_top_left)
         add_time_ids = torch.tensor([add_time_ids], dtype=prompt_embeds.dtype)
 
-        if self.do_classifier_free_guidance:
+        # For classifier free guidance, we need to do two forward passes.
+        # Here we concatenate the unconditional and text embeddings into a single batch
+        # to avoid doing two forward passes
+        if self.do_perturbed_attention_guidance:
+            prompt_embeds = self._prepare_perturbed_attention_guidance(
+                prompt_embeds, negative_prompt_embeds, self.do_classifier_free_guidance
+            )
+            prompt_attention_mask = self._prepare_perturbed_attention_guidance(
+                prompt_attention_mask, negative_prompt_attention_mask, self.do_classifier_free_guidance
+            )
+            prompt_embeds_2 = self._prepare_perturbed_attention_guidance(
+                prompt_embeds_2, negative_prompt_embeds_2, self.do_classifier_free_guidance
+            )
+            prompt_attention_mask_2 = self._prepare_perturbed_attention_guidance(
+                prompt_attention_mask_2, negative_prompt_attention_mask_2, self.do_classifier_free_guidance
+            )
+            add_time_ids = torch.cat([add_time_ids] * B_PAG, dim=0)
+            style = torch.cat([style] * B_PAG, dim=0)
+        elif self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask])
             prompt_embeds_2 = torch.cat([negative_prompt_embeds_2, prompt_embeds_2])
@@ -1186,14 +1226,22 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
 
         # 10. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
         self._num_timesteps = len(timesteps)
+        if self.do_perturbed_attention_guidance:
+            original_attn_proc = self.transformer.attn_processors
+            self._set_pag_attn_processor(
+                pag_applied_layers=self.pag_applied_layers,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+            )
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
 
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                latent_model_input = torch.cat([latents] * (prompt_embeds.shape[0] // latents.shape[0]))
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 if i < len(timesteps) * (1 - clip_apply_ratio) and clip_encoder_hidden_states_input is not None:
@@ -1240,7 +1288,11 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
                 noise_pred, _ = noise_pred.chunk(2, dim=1)
 
                 # perform guidance
-                if self.do_classifier_free_guidance:
+                if self.do_perturbed_attention_guidance:
+                    noise_pred = self._apply_perturbed_attention_guidance(
+                        noise_pred, self.do_classifier_free_guidance, guidance_scale, t
+                    )
+                elif self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
@@ -1305,6 +1357,9 @@ class EasyAnimatePipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline):
 
         # Offload all models
         self.maybe_free_model_hooks()
+
+        if self.do_perturbed_attention_guidance:
+            self.transformer.set_attn_processor(original_attn_proc)
 
         if not return_dict:
             return video

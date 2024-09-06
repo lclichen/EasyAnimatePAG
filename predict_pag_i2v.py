@@ -1,30 +1,37 @@
 import os
+
+import cv2
 import numpy as np
 import torch
-import cv2
 from diffusers import (AutoencoderKL, DDIMScheduler,
                        DPMSolverMultistepScheduler,
                        EulerAncestralDiscreteScheduler, EulerDiscreteScheduler,
                        PNDMScheduler)
 from omegaconf import OmegaConf
 from PIL import Image
-from transformers import CLIPVisionModelWithProjection,  CLIPImageProcessor
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 from easyanimate.models.autoencoder_magvit import AutoencoderKLMagvit
-from easyanimate.models.transformer3d import Transformer3DModel
-from easyanimate.models.transformer3d import Transformer3DModel, HunyuanTransformer3DModel
-from easyanimate.pipeline.pipeline_easyanimate_multi_text_encoder_inpaint import EasyAnimatePipeline_Multi_Text_Encoder_Inpaint
-from easyanimate.pipeline.pipeline_easyanimate_inpaint import \
-    EasyAnimateInpaintPipeline
+from easyanimate.models.transformer3d import (HunyuanTransformer3DModel,
+                                              Transformer3DModel)
+from easyanimate.pipeline.pipeline_pag_easyanimate_inpaint import \
+    EasyAnimatePAGInpaintPipeline
+from easyanimate.pipeline.pipeline_pag_easyanimate_multi_text_encoder_inpaint import \
+    EasyAnimatePAGPipeline_Multi_Text_Encoder_Inpaint
 from easyanimate.utils.lora_utils import merge_lora, unmerge_lora
-from easyanimate.utils.utils import save_videos_grid, get_image_to_video_latent
+from easyanimate.utils.utils import get_image_to_video_latent, save_videos_grid
 
 # Low gpu memory mode, this is used when the GPU memory is under 16GB
 low_gpu_memory_mode = False
 
 # Config and model path
-config_path         = "config/easyanimate_video_slicevae_multi_text_encoder_v4.yaml"
-model_name          = "models/Diffusion_Transformer/EasyAnimateV4-XL-2-InP"
+EAVersion = "V3"
+if EAVersion == "V4":
+    config_path         = "config/easyanimate_video_slicevae_multi_text_encoder_v4.yaml"
+    model_name          = "models/Diffusion_Transformer/EasyAnimateV4-XL-2-InP"
+elif EAVersion == "V3":
+    config_path         = "config/easyanimate_video_slicevae_motion_module_v3.yaml"
+    model_name          = "models/Diffusion_Transformer/EasyAnimateV3-XL-2-InP-512x512"
 
 # Choose the sampler in "Euler" "Euler A" "DPM++" "PNDM" and "DDIM"
 sampler_name        = "Euler"
@@ -55,11 +62,12 @@ validation_image_start  = "asset/1.png"
 validation_image_end    = None
 
 # We support English and Chinese in V4
-prompt                  = "一条狗看着屏幕。质量高、杰作、最佳品质、高分辨率、超精细、梦幻般。"
-negative_prompt         = "低质量，不清晰，突变，变形，失真。"
-# prompt                  = "The dog is looking at camera and smiling. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic."
-# negative_prompt         = "The video is not of a high quality, it has a low resolution, and the audio quality is not clear. Strange motion trajectory, a poor composition and deformed video, low resolution, duplicate and ugly, strange body structure, long and strange neck, bad teeth, bad eyes, bad limbs, bad hands, rotating camera, blurry camera, shaking camera. Deformation, low-resolution, blurry, ugly, distortion. "
-guidance_scale          = 7.0
+# prompt                  = "一条狗看着屏幕。质量高、杰作、最佳品质、高分辨率、超精细、梦幻般。"
+# negative_prompt         = "低质量，不清晰，突变，变形，失真。"
+prompt                  = "The dog is looking at camera and smiling. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic."
+negative_prompt         = "The video is not of a high quality, it has a low resolution, and the audio quality is not clear. Strange motion trajectory, a poor composition and deformed video, low resolution, duplicate and ugly, strange body structure, long and strange neck, bad teeth, bad eyes, bad limbs, bad hands, rotating camera, blurry camera, shaking camera. Deformation, low-resolution, blurry, ugly, distortion. "
+guidance_scale          = 4.0
+pag_scale               = 2.5
 seed                    = 43
 num_inference_steps     = 25
 lora_weight             = 0.60
@@ -147,12 +155,17 @@ Choosen_Scheduler = scheduler_dict = {
     "DDIM": DDIMScheduler,
 }[sampler_name]
 
+pag_layer = ["blocks.14"] # ["blocks.24"]
+layer_str = "-".join(pag_layer)
+# V3 block_max = 27
+# V4 block_max = 39
+# Note that: different model may need different layer to be applied with PAG.
 if config.get('enable_multi_text_encoder', False):
     scheduler = Choosen_Scheduler.from_pretrained(
         model_name, 
         subfolder="scheduler"
     )
-    pipeline = EasyAnimatePipeline_Multi_Text_Encoder_Inpaint.from_pretrained(
+    pipeline = EasyAnimatePAGPipeline_Multi_Text_Encoder_Inpaint.from_pretrained(
         model_name,
         vae=vae,
         transformer=transformer,
@@ -160,11 +173,13 @@ if config.get('enable_multi_text_encoder', False):
         torch_dtype=weight_dtype,
         clip_image_encoder=clip_image_encoder,
         clip_image_processor=clip_image_processor,
+        pag_applied_layers=pag_layer,
+        enable_pag=True,
     )
 else:
     scheduler = Choosen_Scheduler(**OmegaConf.to_container(config['noise_scheduler_kwargs']))
 
-    pipeline = EasyAnimateInpaintPipeline.from_pretrained(
+    pipeline = EasyAnimatePAGInpaintPipeline.from_pretrained(
         model_name,
         vae=vae,
         transformer=transformer,
@@ -172,6 +187,8 @@ else:
         torch_dtype=weight_dtype,
         clip_image_encoder=clip_image_encoder,
         clip_image_processor=clip_image_processor,
+        pag_applied_layers=pag_layer,
+        enable_pag=True,
     )
 
 if low_gpu_memory_mode:
@@ -212,6 +229,7 @@ if partial_video_length is not None:
                 width       = sample_size[1],
                 generator   = generator,
                 guidance_scale = guidance_scale,
+                pag_scale    = pag_scale,
                 num_inference_steps = num_inference_steps,
 
                 video        = input_video,
@@ -256,6 +274,7 @@ else:
             width       = sample_size[1],
             generator   = generator,
             guidance_scale = guidance_scale,
+            pag_scale    = pag_scale,
             num_inference_steps = num_inference_steps,
 
             video        = input_video,
@@ -281,5 +300,5 @@ if video_length == 1:
     image = Image.fromarray(image)
     image.save(save_sample_path)
 else:
-    video_path = os.path.join(save_path, prefix + ".mp4")
+    video_path = os.path.join(save_path, prefix + f"_{EAVersion}_{layer_str}_{pag_scale}_{guidance_scale}.mp4")
     save_videos_grid(sample, video_path, fps=fps)

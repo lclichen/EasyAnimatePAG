@@ -1,10 +1,8 @@
-
-
+import json
 import os
 
 import numpy as np
 import torch
-import json
 from diffusers import (AutoencoderKL, DDIMScheduler,
                        DPMSolverMultistepScheduler,
                        EulerAncestralDiscreteScheduler, EulerDiscreteScheduler,
@@ -14,12 +12,15 @@ from PIL import Image
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 from easyanimate.models.autoencoder_magvit import AutoencoderKLMagvit
-from easyanimate.models.transformer3d import Transformer3DModel, HunyuanTransformer3DModel
-from easyanimate.pipeline.pipeline_easyanimate_multi_text_encoder import EasyAnimatePipeline_Multi_Text_Encoder
-from easyanimate.pipeline.pipeline_easyanimate_multi_text_encoder_inpaint import EasyAnimatePipeline_Multi_Text_Encoder_Inpaint
+from easyanimate.models.transformer3d import (HunyuanTransformer3DModel,
+                                              Transformer3DModel)
 from easyanimate.pipeline.pipeline_easyanimate import EasyAnimatePipeline
-from easyanimate.pipeline.pipeline_easyanimate_inpaint import \
-    EasyAnimateInpaintPipeline
+from easyanimate.pipeline.pipeline_easyanimate_multi_text_encoder import \
+    EasyAnimatePipeline_Multi_Text_Encoder
+from easyanimate.pipeline.pipeline_pag_easyanimate_inpaint import \
+    EasyAnimateInpaintPAGPipeline
+from easyanimate.pipeline.pipeline_pag_easyanimate_multi_text_encoder_inpaint import \
+    EasyAnimatePAGPipeline_Multi_Text_Encoder_Inpaint
 from easyanimate.utils.lora_utils import merge_lora, unmerge_lora
 from easyanimate.utils.utils import get_image_to_video_latent, save_videos_grid
 
@@ -27,8 +28,14 @@ from easyanimate.utils.utils import get_image_to_video_latent, save_videos_grid
 low_gpu_memory_mode = False
 
 # Config and model path
-config_path         = "config/easyanimate_video_slicevae_multi_text_encoder_v4.yaml"
-model_name          = "models/Diffusion_Transformer/EasyAnimateV4-XL-2-InP"
+EAVersion = "V3"
+if EAVersion == "V4":
+    config_path         = "config/easyanimate_video_slicevae_multi_text_encoder_v4.yaml"
+    model_name          = "models/Diffusion_Transformer/EasyAnimateV4-XL-2-InP"
+elif EAVersion == "V3":
+    config_path         = "config/easyanimate_video_slicevae_motion_module_v3.yaml"
+    model_name          = "models/Diffusion_Transformer/EasyAnimateV3-XL-2-InP-512x512"
+
 
 # Choose the sampler in "Euler" "Euler A" "DPM++" "PNDM" and "DDIM"
 sampler_name        = "Euler"
@@ -51,11 +58,12 @@ fps                 = 24
 # ome graphics cards, such as v100, 2080ti, do not support torch.bfloat16
 weight_dtype        = torch.bfloat16
 # We support English and Chinese in V4
-prompt              = "一位年轻女子，有着美丽清澈的眼睛和金发，站在森林里，穿着白色的衣服，戴着皇冠。她似乎陷入了沉思，相机聚焦在她的脸上。质量高、杰作、最佳品质、高分辨率、超精细、梦幻般。"
-negative_prompt     = "低质量，不清晰，突变，变形，失真。"
-# prompt              = "A young woman with beautiful and clear eyes and blonde hair standing and white dress in a forest wearing a crown. She seems to be lost in thought, and the camera focuses on her face. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic."
-# negative_prompt     = "The video is not of a high quality, it has a low resolution, and the audio quality is not clear. Strange motion trajectory, a poor composition and deformed video, low resolution, duplicate and ugly, strange body structure, long and strange neck, bad teeth, bad eyes, bad limbs, bad hands, rotating camera, blurry camera, shaking camera. Deformation, low-resolution, blurry, ugly, distortion. " 
-guidance_scale      = 7.0
+# prompt              = "一位年轻女子，有着美丽清澈的眼睛和金发，站在森林里，穿着白色的衣服，戴着皇冠。她似乎陷入了沉思，相机聚焦在她的脸上。质量高、杰作、最佳品质、高分辨率、超精细、梦幻般。"
+# negative_prompt     = "低质量，不清晰，突变，变形，失真。"
+prompt              = "A young woman with beautiful and clear eyes and blonde hair standing and white dress in a forest wearing a crown. She seems to be lost in thought, and the camera focuses on her face. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic."
+negative_prompt     = "The video is not of a high quality, it has a low resolution, and the audio quality is not clear. Strange motion trajectory, a poor composition and deformed video, low resolution, duplicate and ugly, strange body structure, long and strange neck, bad teeth, bad eyes, bad limbs, bad hands, rotating camera, blurry camera, shaking camera. Deformation, low-resolution, blurry, ugly, distortion. " 
+guidance_scale      = 4.0
+pag_scale           = 2.5
 seed                = 43
 num_inference_steps = 25
 lora_weight         = 0.60
@@ -65,8 +73,10 @@ config = OmegaConf.load(config_path)
 
 # Get Transformer
 if config.get('enable_multi_text_encoder', False):
+    # V4
     Choosen_Transformer3DModel = HunyuanTransformer3DModel
 else:
+    # V3
     Choosen_Transformer3DModel = Transformer3DModel
 
 transformer_additional_kwargs = OmegaConf.to_container(config['transformer_additional_kwargs'])
@@ -152,9 +162,15 @@ scheduler = Choosen_Scheduler.from_pretrained(
 )
 # scheduler = Choosen_Scheduler(**OmegaConf.to_container(config['noise_scheduler_kwargs']))
 
+pag_layer = ["blocks.14"] # ["blocks.24"]
+layer_str = "-".join(pag_layer)
+# V3 block_max = 27
+# V4 block_max = 39
+# Note that: different model may need different layer to be applied with PAG.
 if config.get('enable_multi_text_encoder', False):
+    # V4
     if transformer.config.in_channels != vae.config.latent_channels:
-        pipeline = EasyAnimatePipeline_Multi_Text_Encoder_Inpaint.from_pretrained(
+        pipeline = EasyAnimatePAGPipeline_Multi_Text_Encoder_Inpaint.from_pretrained(
             model_name,
             vae=vae,
             transformer=transformer,
@@ -162,6 +178,8 @@ if config.get('enable_multi_text_encoder', False):
             torch_dtype=weight_dtype,
             clip_image_encoder=clip_image_encoder,
             clip_image_processor=clip_image_processor,
+            pag_applied_layers=pag_layer,
+            enable_pag=True,
         )
     else:
         pipeline = EasyAnimatePipeline_Multi_Text_Encoder.from_pretrained(
@@ -173,7 +191,7 @@ if config.get('enable_multi_text_encoder', False):
         )
 else:
     if transformer.config.in_channels != vae.config.latent_channels:
-        pipeline = EasyAnimateInpaintPipeline.from_pretrained(
+        pipeline = EasyAnimatePAGInpaintPipeline.from_pretrained(
             model_name,
             vae=vae,
             transformer=transformer,
@@ -181,6 +199,8 @@ else:
             torch_dtype=weight_dtype,
             clip_image_encoder=clip_image_encoder,
             clip_image_processor=clip_image_processor,
+            pag_applied_layers=pag_layer,
+            enable_pag=True,
         )
     else:
         pipeline = EasyAnimatePipeline.from_pretrained(
@@ -213,6 +233,7 @@ with torch.no_grad():
             width       = sample_size[1],
             generator   = generator,
             guidance_scale = guidance_scale,
+            pag_scale    = pag_scale,
             num_inference_steps = num_inference_steps,
 
             video        = input_video,
@@ -249,5 +270,5 @@ if video_length == 1:
     image = Image.fromarray(image)
     image.save(video_path)
 else:
-    video_path = os.path.join(save_path, prefix + ".mp4")
+    video_path = os.path.join(save_path, prefix + f"_{EAVersion}_{layer_str}_{pag_scale}_{guidance_scale}.mp4")
     save_videos_grid(sample, video_path, fps=fps)
