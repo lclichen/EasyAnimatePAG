@@ -1050,14 +1050,16 @@ class EasyAnimatePAGPipeline_Multi_Text_Encoder_Inpaint(DiffusionPipeline, PAGMi
             clip_attention_mask = torch.ones([batch_size, self.transformer.n_query]).to(latents.device, dtype=latents.dtype)
             clip_attention_mask_neg = torch.zeros([batch_size, self.transformer.n_query]).to(latents.device, dtype=latents.dtype)
             
-            clip_encoder_hidden_states_input = self._prepare_perturbed_attention_guidance(
-                clip_encoder_hidden_states, clip_encoder_hidden_states_neg, self.do_classifier_free_guidance
-            )
-            clip_attention_mask_input = self._prepare_perturbed_attention_guidance(
-                clip_attention_mask, clip_attention_mask_neg, self.do_classifier_free_guidance
-            )
-            # clip_encoder_hidden_states_input = torch.cat([clip_encoder_hidden_states_neg, clip_encoder_hidden_states]) if self.do_classifier_free_guidance else clip_encoder_hidden_states
-            # clip_attention_mask_input = torch.cat([clip_attention_mask_neg, clip_attention_mask]) if self.do_classifier_free_guidance else clip_attention_mask
+            if self.do_perturbed_attention_guidance:
+                clip_encoder_hidden_states_input = self._prepare_perturbed_attention_guidance(
+                    clip_encoder_hidden_states, clip_encoder_hidden_states_neg, self.do_classifier_free_guidance
+                )
+                clip_attention_mask_input = self._prepare_perturbed_attention_guidance(
+                    clip_attention_mask, clip_attention_mask_neg, self.do_classifier_free_guidance
+                )
+            else:
+                clip_encoder_hidden_states_input = torch.cat([clip_encoder_hidden_states_neg, clip_encoder_hidden_states]) if self.do_classifier_free_guidance else clip_encoder_hidden_states
+                clip_attention_mask_input = torch.cat([clip_attention_mask_neg, clip_attention_mask]) if self.do_classifier_free_guidance else clip_attention_mask
 
         elif clip_image is None and num_channels_transformer != num_channels_latents:
             clip_encoder_hidden_states = torch.zeros(

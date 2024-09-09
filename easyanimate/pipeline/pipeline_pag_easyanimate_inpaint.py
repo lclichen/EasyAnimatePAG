@@ -969,14 +969,16 @@ class EasyAnimatePAGInpaintPipeline(DiffusionPipeline, PAGMixin):
             clip_attention_mask = torch.ones([batch_size, 8]).to(latents.device, dtype=latents.dtype)
             clip_attention_mask_neg = torch.zeros([batch_size, 8]).to(latents.device, dtype=latents.dtype)
 
-            clip_encoder_hidden_states_input = self._prepare_perturbed_attention_guidance(
-                clip_encoder_hidden_states, clip_encoder_hidden_states_neg, do_classifier_free_guidance
-            )
-            clip_attention_mask_input = self._prepare_perturbed_attention_guidance(
-                clip_attention_mask, clip_attention_mask_neg, do_classifier_free_guidance
-            )
-            # clip_encoder_hidden_states_input = torch.cat([clip_encoder_hidden_states_neg, clip_encoder_hidden_states]) if do_classifier_free_guidance else clip_encoder_hidden_states
-            # clip_attention_mask_input = torch.cat([clip_attention_mask_neg, clip_attention_mask]) if do_classifier_free_guidance else clip_attention_mask
+            if self.do_perturbed_attention_guidance:
+                clip_encoder_hidden_states_input = self._prepare_perturbed_attention_guidance(
+                    clip_encoder_hidden_states, clip_encoder_hidden_states_neg, do_classifier_free_guidance
+                )
+                clip_attention_mask_input = self._prepare_perturbed_attention_guidance(
+                    clip_attention_mask, clip_attention_mask_neg, do_classifier_free_guidance
+                )
+            else:
+                clip_encoder_hidden_states_input = torch.cat([clip_encoder_hidden_states_neg, clip_encoder_hidden_states]) if do_classifier_free_guidance else clip_encoder_hidden_states
+                clip_attention_mask_input = torch.cat([clip_attention_mask_neg, clip_attention_mask]) if do_classifier_free_guidance else clip_attention_mask
 
         elif clip_image is None and num_channels_transformer == 12:
             clip_encoder_hidden_states = torch.zeros([batch_size, 768]).to(latents.device, dtype=latents.dtype)
@@ -1020,9 +1022,13 @@ class EasyAnimatePAGInpaintPipeline(DiffusionPipeline, PAGMixin):
             resolution = resolution.to(dtype=prompt_embeds.dtype, device=device)
             aspect_ratio = aspect_ratio.to(dtype=prompt_embeds.dtype, device=device)
 
-            if B_PAG == 3:
-                resolution = torch.cat([resolution, resolution, resolution], dim=0)
-                aspect_ratio = torch.cat([aspect_ratio, aspect_ratio, aspect_ratio], dim=0)
+            if self.do_perturbed_attention_guidance:
+                resolution = self._prepare_perturbed_attention_guidance(
+                    resolution, resolution, do_classifier_free_guidance
+                )
+                aspect_ratio = self._prepare_perturbed_attention_guidance(
+                    aspect_ratio, aspect_ratio, do_classifier_free_guidance
+                )
             elif do_classifier_free_guidance:
                 resolution = torch.cat([resolution, resolution], dim=0)
                 aspect_ratio = torch.cat([aspect_ratio, aspect_ratio], dim=0)
